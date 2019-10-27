@@ -1,0 +1,366 @@
+#!/usr/bin/perl -w
+use strict;
+use warnings;
+use feature qw(say);
+
+# Make sure to do: apt install w3c-sgml-lib
+our $VERSION = "1.000";
+
+use Carp;
+use Sys::Hostname;
+use Fcntl qw(O_WRONLY O_CREAT O_TRUNC O_EXCL);
+use Errno qw(ENOENT ESTALE);
+use File::Spec;
+use Getopt::Long 2.24 qw(:config bundling require_order);
+# use XML::Simple qw(:strict);
+use XML::LibXML;
+use Data::Dumper;
+use utf8;
+local $Data::Dumper::Sortkeys = 1;
+local $Data::Dumper::Indent = 1;
+
+use constant {
+    MODE	=> 2,
+    WHERE	=> "/html/body/div/",
+    INDEX	=> "index.html",
+};
+
+my $STORE = "storeArea";
+
+defined(our $hostname = Sys::Hostname::hostname()) ||
+    croak "Cannot determine hostname";
+croak "Hostname looks like an ip address" if
+    $hostname =~ m{^[0-9]+(?:\.[0-9]+)+\z};
+# Just in case the domain got in there
+$hostname =~ s/\..*//s;
+$hostname =~ /^([a-zA-Z0-9_-]+)\z/ ||
+    croak "Hostname '$hostname' looks too weird";
+$hostname = lc $1;
+
+# Import a complete file and return the contents as a single string
+sub slurp {
+    my $file = shift;
+    my ($maybe_gone, $binmode);
+    if (@_) {
+        if (@_ == 1) {
+            $maybe_gone = shift;
+        } else {
+            my %params = @_;
+            $maybe_gone = delete $params{maybe_gone};
+            $binmode	= delete $params{binmode};
+            croak "Unknown parameter ", join(", ", map "'$_'", keys %params) if
+                %params;
+        }
+    }
+    croak "Filename is undefined" if !defined $file;
+    croak "Filename '$file' contains \\x00" if $file =~ s/\x00/\\x00/g;
+    open(my $fh, "<", $file) or
+        $maybe_gone && ($! == ENOENT || $! == ESTALE) ?
+	return undef : croak "Could not open '$file': $!";
+    binmode($fh) if $binmode;
+    my $rc = read($fh, my $slurp, -s $fh);
+    croak "File '$file' is still growing" if $rc &&= read($fh, my $more, 1);
+    croak "Error reading from '$file': $!" if !defined $rc;
+    close($fh) || croak "Error while closing '$file': $!";
+    return $slurp;
+}
+
+sub parent_dir {
+    my ($volume, $directories) = File::Spec->splitpath(@_);
+    return File::Spec->catpath($volume, $directories eq "" ? "." : $directories, "");
+}
+
+sub fsync {
+    my ($path) = @_;
+
+    if ($^O eq "MSWin32") {
+        #open(my $fh, "<", $path) || croak "Could not open '$path': $!";
+        #my $dh = Win32API::File::GetOsFHandle($fh) ||
+        #    croak "Could not get Os handle for '$path'";
+        #FlushFileBuffers($dh) || croak "Could not fsync '$path': $^E";
+    } else {
+        open(my $fh, "<", $path) || croak "Could not open '$path': $!";
+        # Evil trick: Get write handle on read descriptor since perl only does
+        # (f)sync on writable handles
+        open(my $dh, ">&=", fileno($fh)) || croak "Could not fdopen: $!";
+        $dh->sync || croak "Could not fsync '$path': $!";
+    }
+}
+
+# Write remaining arguments to the file named in the first argument
+# File is deleted on failure
+# (When copying this code into test files you probably want to change the
+#  default for fsync to 0 and depending on what is being tested maybe the
+#  default for binmode to 1)
+sub spew {
+    my $file = shift;
+    croak "filename is undefined" if !defined $file;
+    defined || croak "undef value" for @_;
+
+    my $fsync = 1;
+    my $binmode;
+    my $mode = 0666;
+    my $exclusive = 0;
+    my ($uid, $gid, $atomic);
+    if (ref $_[0]) {
+        ref $_[0] eq "HASH" || croak "Invalid spew parameters";
+        my %params = %{+shift};
+
+        $fsync     = delete $params{fsync} if exists $params{fsync};
+        $binmode   = delete $params{binmode};
+        $exclusive = delete $params{exclusive};
+        $atomic	   = delete $params{atomic};
+        if (exists $params{mode}) {
+            $mode = delete $params{mode};
+            if (defined $mode) {
+                looks_like_number($mode) ||
+                    croak "mode '$mode' doesn't look like a number";
+                if ($mode =~ /^0[0-9]/) {
+                    # Octal string
+                    $mode =~ /^[0-7]+\z/ ||
+                        croak "Mode '$mode' is not a valid octal number";
+                    $mode = oct($mode);
+                } else {
+                    # undo it being a string
+                    $mode = $mode+0;
+                    $mode == int $mode ||
+                        croak "mode '$mode' is not an integer";
+                }
+                croak sprintf("Invalid mode 0%03o", $mode) if $mode & ~0777;
+            }
+        }
+        if (defined($uid = delete $params{uid})) {
+            $uid =~ /^[0-9]+\z/ || croak "Uid '$uid' is not a natural number";
+            $uid += 0;
+            $mode = 0666 if !defined $mode;
+        }
+        if (defined($gid = delete $params{gid})) {
+            $gid =~ /^[0-9]+\z/ || croak "Gid '$gid' is not a natural number";
+            $gid += 0;
+            $mode = 0666 if !defined $mode;
+        }
+
+        croak "Unknown parameter ", join(", ", map "'$_'", keys %params) if
+            %params;
+    }
+    my $tmp = $atomic ? "$file.new.$hostname.$$" : $file;
+    sysopen(my $fh, $tmp,
+            O_WRONLY | O_CREAT | ($exclusive ? O_EXCL : O_TRUNC),
+            defined $uid || defined $gid ? $mode & 0444 :
+            defined $mode ? $mode : 0666) ||
+                croak "Could not create '$tmp': $!";
+    binmode $fh if $binmode;
+    if (defined $uid || defined $gid) {
+        $uid = -1 if !defined $uid;
+        $gid = -1 if !defined $gid;
+        eval {
+            ## no critic (UselessNoCritic RequireCheckedSyscalls)
+            chown($uid, $gid, $fh);
+        } || do {
+            croak "Could not chown $uid, $gid, '$tmp': $^E" if !$@;
+            # Ok, this system doesn't support fchown
+            # Try for plain chown, though it's racy if someone renames the
+            # file in the mean time
+            chown($uid, $gid, $tmp) ||
+                croak "Could not chown $uid, $gid, '$tmp': $!";
+            # Here we could check if the fstat looks ok now, but we run into
+            # problems with system that don't actually HAVE sane mode bits
+            # (I'm looking at you windows).
+            # Just assume that we won the race
+        };
+    }
+    # Mode must come after uid/gid
+    if (defined $mode ) {
+        my @stat = stat($fh) or
+            croak "Assertion: Cannot fstat open file '$tmp': $!";
+        $mode &= ~ umask();
+        if (($stat[MODE] & 07777) != $mode) {
+            # File has permissions different from what we want
+            eval {
+                ## no critic (UselessNoCritic RequireCheckedSyscalls)
+                chmod($mode, $fh);
+            } || do {
+                croak "Could not chmod '$tmp': $!" if !$@;
+                # Ok, this system doesn't support fchmod
+                # Try for plain chmod, though it's racy if someone renames the
+                # file in the mean time
+                chmod($mode, $tmp) || croak "Could not chmod '$tmp': $!";
+                # Here we could check if the fstat looks ok now, but we run into
+                # problems with system that don't actually HAVE sane mode bits
+                # (I'm looking at you windows).
+                # Just assume that we won the race
+            };
+        }
+    }
+    eval {
+        local ($\, $,);
+        my $old_fh = select($fh);
+        $| = 1;
+        select($old_fh);
+        print($fh @_)	|| croak "Error writing to '$tmp': $!";
+        $^O eq "MSWin32" || $fh->sync || croak "Error syncing '$tmp': $!" if
+            $fsync;
+        close($fh)	|| croak "Error closing '$tmp': $!";
+        !$atomic || rename($tmp, $file) ||
+            croak "Could not rename '$tmp' to '$file': $!";
+    };
+    if ($@) {
+        undef $fh;
+        unlink($tmp) || die "Could not unlink '$tmp' after $@";
+        die $@;
+    }
+    !$atomic || !$fsync || eval { fsync(parent_dir($file)) } || warn $@;
+    return;
+}
+
+sub in {
+    my ($child, $id, $data) = @_;
+
+    if ($id eq $STORE) {
+        for my $tidler ($child->childNodes) {
+            my $type = $tidler->nodeName;
+            if ($type eq "#text") {
+                my $str = $tidler->toString;
+                die "Unexpected text <$str>" if $str ne "\n";
+            } elsif ($type eq "div") {
+                my $title = $tidler->getAttribute("title");
+                defined $title ||
+                    die "$STORE node without title";
+                $title ne "" ||
+                    die "$STORE node with empty title";
+                $title !~ /\0/ ||
+                    die "$STORE node with \\0 in title";
+                $title ne "." && $title ne ".." ||
+                    die "$STORE node with bad filesystem title '$title'";
+                # say "title=$title";
+                # $title =~ s{([/\\%])}{sprintf("%%%02X", ord $1)}eg;
+                die "Already saw tidler '$title'" if
+                    exists $data->{$STORE}{$title};
+                my $content = $tidler->toString;
+                $content .= "\n";
+                utf8::encode($content);
+                $data->{$STORE}{$title} = $content;
+            } else {
+                die "Unexpected $STORE elememnt '$type'";
+            }
+            $child->removeChild($tidler);
+        }
+    } else {
+        my $content = $child->toString;
+        $content .= "\n";
+        utf8::encode($content);
+        # say "id=$id";
+        die "Already saw id '$id'" if exists $data->{$id};
+        $data->{$id} = $content;
+        for my $elem ($child->childNodes) {
+            $child->removeChild($elem);
+        }
+    }
+}
+
+sub out {
+    my ($child, $id, $data, $parser) = @_;
+
+    my $content;
+    if ($id eq $STORE) {
+        my $store = $data->{$STORE};
+        my $accu = "\n";
+        for my $name (sort keys %$store) {
+            $accu .= $store->{$name};
+        }
+        $content = $child->toString;
+        # $content is text
+        utf8::encode($content);
+        # $content is bytes
+        $content =~ s{(</div>)\z}{$accu$1\n} ||
+            die "Content |$content| does not end in </div>";
+    } else {
+        $content = $data->{$id} // die "Missing id '$id'";
+    }
+    $content =~ s/\n\z// || die "Content does not end on \\n";
+    # $content is bytes
+    my $fragment = $parser->parse_balanced_chunk($content);
+
+    #my $dom = $parser->load_xml(string => $content);
+    #my $top = $dom->documentElement;
+    #my $child_type = $child->nodeName;
+    #my $content_type  = $fragment->nodeName;
+    #$child_type eq $content_type ||
+    #    die "Template $id has type '$child_type', but content has '$content_type'";
+
+    $child->parentNode->replaceChild($fragment, $child);
+}
+
+sub expand {
+    my ($name, $elem, $data, $parser) = @_;
+
+    foreach my $child ($elem->childNodes) {
+        my $n = $child->nodeName;
+        if (my ($type) = $n =~ /^#(.*)/s) {
+        } else {
+            next if $n =~ m{/} || $n ne quotemeta($n);;
+            $n = "$name$n/";
+            next unless WHERE() =~ /^$n/;
+            if (WHERE() eq $n) {
+                my $id = $child->getAttribute("id");
+                if (defined $id) {
+                    $id =~ /^\w+\z/ || die "Unsafe id $id";
+                    if ($parser) {
+                        out($child, $id, $data, $parser);
+                    } else {
+                        in($child, $id, $data);
+                    }
+                    next;
+                }
+            }
+            expand("$n", $child, $data, $parser);
+        }
+    }
+}
+
+sub parse {
+    my ($parser, $string_in) = @_;
+
+    # load_ext_dtd => 0 also stops catalogs from working
+    my $dom = $parser->load_xml(string => $string_in);
+
+    my $top = $dom->documentElement;
+    my $top_name = $top->nodeName;
+    $top_name eq "html" || die "Top element is '$top_name' instead of html";
+    my $data = {};
+    expand("/html/", $top, $data);
+    my $content = $dom->toString;
+    utf8::encode($content);
+    my $name = INDEX;
+    die "Already saw '$name'" if exists $data->{$name};
+    $data->{$name} = $content;
+    return $data;
+}
+
+sub unparse {
+    my ($parser, $data) = @_;
+
+    my $content = $data->{INDEX()};
+    # $content is bytes
+    my $dom = $parser->load_xml(string => $content);
+
+    my $top = $dom->documentElement;
+    my $top_name = $top->nodeName;
+    $top_name eq "html" || die "Top element is '$top_name' instead of html";
+    expand("/html/", $top, $data, $parser);
+    return $dom->toString;
+}
+
+my $parser = XML::LibXML->new(no_network => 1,
+                              # expand_entities => 0,
+                              load_ext_dtd => 1);
+# Catalog is loaded automatically
+# $parser->load_catalog("/etc/xml/catalog");
+
+for my $file (@ARGV) {
+    my $string_in = slurp($file);
+    my $data = parse($parser, $string_in);
+
+    my $string_out = unparse($parser, $data);
+    print $string_out;
+}
