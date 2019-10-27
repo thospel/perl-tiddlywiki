@@ -6,16 +6,38 @@ use feature qw(say);
 # Make sure to do: apt install w3c-sgml-lib
 our $VERSION = "1.000";
 
+# If the program runs as /foobar/bin/program, find libraries in /foobar/lib
+my $base;
+BEGIN {
+    # Even on windows FindBin uses / in the reported path
+    use FindBin ();
+    $FindBin::Bin =~
+        ($^O eq "MSWin32" ?
+         qr{^((?:[A-Z]:)?(?:/[a-zA-Z0-9_:.~ -]+)*)/[a-zA-Z0-9_.-]+/*\z} :
+         qr{^((?:/[a-zA-Z0-9_:.-]+)*)/[a-zA-Z0-9_.-]+/*\z}) ||
+         die "Could not parse bin directory '$FindBin::Bin'";
+    # Use untainted version of lib
+    require lib;
+    $base = $1;
+    "lib"->import(@ARGV && $ARGV[0] eq "--blib" ? shift && "$base/blib/lib" : "$base/lib");
+}
+
+print STDERR "Base=$base\n";
+$ENV{PATH} = "/usr/bin:/bin";
+delete @ENV{qw(IFS CDPATH ENV BASH_ENV)};
+
+# use utf8;
 use Carp;
+use POSIX qw(strftime);
 use Sys::Hostname;
 use Fcntl qw(O_WRONLY O_CREAT O_TRUNC O_EXCL);
 use Errno qw(ENOENT ESTALE);
 use File::Spec;
 use Getopt::Long 2.24 qw(:config bundling require_order);
 # use XML::Simple qw(:strict);
-use XML::LibXML;
+#use XML::LibXML;
+use XML::Parser;
 use Data::Dumper;
-use utf8;
 local $Data::Dumper::Sortkeys = 1;
 local $Data::Dumper::Indent = 1;
 
@@ -213,154 +235,168 @@ sub spew {
     return;
 }
 
-sub in {
-    my ($child, $id, $data) = @_;
+sub handle {
+    my ($out, $state, $start, $parser, $elt, %attr) = @_;
 
-    if ($id eq $STORE) {
-        for my $tidler ($child->childNodes) {
-            my $type = $tidler->nodeName;
-            if ($type eq "#text") {
-                my $str = $tidler->toString;
-                die "Unexpected text <$str>" if $str ne "\n";
-            } elsif ($type eq "div") {
-                my $title = $tidler->getAttribute("title");
-                defined $title ||
-                    die "$STORE node without title";
-                $title ne "" ||
-                    die "$STORE node with empty title";
-                $title !~ /\0/ ||
-                    die "$STORE node with \\0 in title";
-                $title ne "." && $title ne ".." ||
-                    die "$STORE node with bad filesystem title '$title'";
-                # say "title=$title";
-                # $title =~ s{([/\\%])}{sprintf("%%%02X", ord $1)}eg;
-                die "Already saw tidler '$title'" if
-                    exists $data->{$STORE}{$title};
-                my $content = $tidler->toString;
-                $content .= "\n";
-                utf8::encode($content);
-                $data->{$STORE}{$title} = $content;
-            } else {
-                die "Unexpected $STORE elememnt '$type'";
-            }
-            $child->removeChild($tidler);
-        }
-    } else {
-        my $content = $child->toString;
-        $content .= "\n";
-        utf8::encode($content);
-        # say "id=$id";
-        die "Already saw id '$id'" if exists $data->{$id};
-        $data->{$id} = $content;
-        for my $elem ($child->childNodes) {
-            $child->removeChild($elem);
-        }
+    $elt eq "div" || return;
+    my @context = $parser->context;
+    @context >= 2 && @context <= 3 && $context[1] eq "body" && $context[0] eq "html" || return;
+    if (@context == 3) {
+        $context[2] eq "div" || return;
+        my $id = $state->{div_key} // return;
+        $id eq $STORE || return;
     }
-}
 
-sub out {
-    my ($child, $id, $data, $parser) = @_;
-
-    my $content;
-    if ($id eq $STORE) {
-        my $store = $data->{$STORE};
-        my $accu = "\n";
-        for my $name (sort keys %$store) {
-            $accu .= $store->{$name};
-        }
-        $content = $child->toString;
-        # $content is text
-        utf8::encode($content);
-        # $content is bytes
-        $content =~ s{(</div>)\z}{$accu$1\n} ||
-            die "Content |$content| does not end in </div>";
-    } else {
-        $content = $data->{$id} // die "Missing id '$id'";
-    }
-    $content =~ s/\n\z// || die "Content does not end on \\n";
-    # $content is bytes
-    my $fragment = $parser->parse_balanced_chunk($content);
-
-    #my $dom = $parser->load_xml(string => $content);
-    #my $top = $dom->documentElement;
-    #my $child_type = $child->nodeName;
-    #my $content_type  = $fragment->nodeName;
-    #$child_type eq $content_type ||
-    #    die "Template $id has type '$child_type', but content has '$content_type'";
-
-    $child->parentNode->replaceChild($fragment, $child);
-}
-
-sub expand {
-    my ($name, $elem, $data, $parser) = @_;
-
-    foreach my $child ($elem->childNodes) {
-        my $n = $child->nodeName;
-        if (my ($type) = $n =~ /^#(.*)/s) {
-        } else {
-            next if $n =~ m{/} || $n ne quotemeta($n);;
-            $n = "$name$n/";
-            next unless WHERE() =~ /^$n/;
-            if (WHERE() eq $n) {
-                my $id = $child->getAttribute("id");
-                if (defined $id) {
-                    $id =~ /^\w+\z/ || die "Unsafe id $id";
-                    if ($parser) {
-                        out($child, $id, $data, $parser);
-                    } else {
-                        in($child, $id, $data);
-                    }
-                    next;
+    my $original_string = $parser->original_string;
+    my $current_byte = $parser->current_byte - $state->{offset};
+    my $len = length($original_string);
+    my $end = $current_byte + $len;
+    my $chunk = substr($state->{content}, 0, $end, "");
+    $state->{offset} += $end;
+    my $line = $parser->current_line;
+    if (@context == 2) {
+        if ($start) {
+            my $id = $attr{id} // die "$elt: No id at line $line\n";
+            !defined $state->{div_key} || die "Assertion: $elt: id '$id' while active '$state->{div_key}' at line $line";
+            $state->{div_key} = $id;
+            if ($out) {
+                if ($id ne $STORE) {
+                    substr($chunk, $current_byte, $len, "");
                 }
+            } else {
+                $state->{divs}{$id} = $original_string;
             }
-            expand("$n", $child, $data, $parser);
+            $state->{template} .= $chunk;
+        } else {
+            my $id = $state->{div_key} //
+                die "Assertion: $elt: end without id at line $line";
+            $state->{div_key} = undef;
+            if ($out) {
+                if ($id eq $STORE) {
+                    for my $title (sort keys %{$state->{store}}) {
+                        my $chunk = $state->{store}{$title};
+                        $chunk =~ s/\n\z// ||
+                            die "Chunk title '$title' does not end in \\n";
+                        $state->{template} .= "\n";
+                        $state->{template} .= $chunk;
+                    }
+                } else {
+                    $chunk = $state->{divs}{$id};
+                    $chunk =~ s/\n\z// ||
+                        die "Chunk '$id' does not end in \\n";
+                }
+                $state->{template} .= $chunk;
+            } else {
+                $state->{template} .= $id eq $STORE ? $chunk : $original_string;
+                $state->{divs}{$id} .= $chunk;
+                $state->{divs}{$id} .= "\n";
+            }
+        }
+    } else {
+        !$out || die "Parsing $STORE in out";
+        # Due to the tests above we are in id $STORE
+        if ($start) {
+            my $title = $attr{title} // die "$elt: No title at line $line\n";
+            !defined $state->{store_key} || die "Assertion: $elt: title '$title' while active '$state->{store_key}' at line $line";
+            $state->{store_key} = $title;
+            $chunk =~ s/^\n// ||
+                die "$elt line $line does not have a preceding newline";
+            $state->{store}{$title} = $chunk;
+        } else {
+            my $title = $state->{store_key} //
+                die "Assertion: $elt: end without title at line $line";
+            $state->{store_key} = undef;
+            $state->{store}{$title} .= $chunk;
+            $state->{store}{$title} .= "\n";
         }
     }
 }
 
 sub parse {
-    my ($parser, $string_in) = @_;
+    my ($out, $state) = @_;
 
-    # load_ext_dtd => 0 also stops catalogs from working
-    my $dom = $parser->load_xml(string => $string_in);
+    $state->{offset} = 0;
+    $state->{template}  = "";
+    $state->{div_key}   = undef;
+    $state->{store_key} = undef;
 
-    my $top = $dom->documentElement;
-    my $top_name = $top->nodeName;
-    $top_name eq "html" || die "Top element is '$top_name' instead of html";
-    my $data = {};
-    expand("/html/", $top, $data);
-    my $content = $dom->toString;
-    utf8::encode($content);
-    my $name = INDEX;
-    die "Already saw '$name'" if exists $data->{$name};
-    $data->{$name} = $content;
-    return $data;
+    my $p1 = XML::Parser->new(Handlers => {
+        Start   => sub { handle($out, $state, 1, @_) },
+        End	=> sub { handle($out, $state, 0, @_) },
+    });
+    my $content = $state->{content};
+    $p1->parse($content);
+    if ($out) {
+        !defined $state->{divs}{$STORE} || die "Unexpected $STORE";
+    } else {
+        delete $state->{divs}{$STORE} || die "No $STORE";
+    }
+    !defined delete $state->{store_key} || die "store still active";
+    !defined delete $state->{div_key} || die "div still active";
+    $state->{template} .= delete $state->{content};
+    delete $state->{offset};
+    return delete $state->{template};
 }
 
-sub unparse {
-    my ($parser, $data) = @_;
-
-    my $content = $data->{INDEX()};
-    # $content is bytes
-    my $dom = $parser->load_xml(string => $content);
-
-    my $top = $dom->documentElement;
-    my $top_name = $top->nodeName;
-    $top_name eq "html" || die "Top element is '$top_name' instead of html";
-    expand("/html/", $top, $data, $parser);
-    return $dom->toString;
+sub git {
+    my $rc = system("git", @_);
+    die "Unexpected exit code $rc from git @_" if $rc;
 }
 
-my $parser = XML::LibXML->new(no_network => 1,
-                              # expand_entities => 0,
-                              load_ext_dtd => 1);
-# Catalog is loaded automatically
-# $parser->load_catalog("/etc/xml/catalog");
+sub maybe_spew {
+    my ($file, $content) = @_;
+    die "Bad file '$file'" if $file =~ m{(?:^|/)\.};
+
+    my $old = slurp($file, maybe_gone => 1);
+    my $changed = 0;
+    if (defined $old && $old eq $content) {
+        # print STDERR "Not updating $file\n";
+    } else {
+        spew($file, { fsync => 0, atomic => 1 }, $content);
+        $changed = 1;
+    }
+    return $changed;
+}
+
+sub output {
+    my ($state, $template) = @_;
+
+    my @files;
+    my $dir = "../TiddlyWiki";
+    chdir($dir) || die "Could not change to '$dir': $!";
+    my $changes = 0;
+    $changes += maybe_spew("template.html", $template);
+    push @files, "template.html";
+    for my $id (sort keys %{$state->{divs}}) {
+        my $name = $id;
+        $name =~ s{([/\\%])}{sprintf("%%%02X", ord $1)}eg;
+        $changes += maybe_spew("$name.xml", $state->{divs}{$id});
+        push @files, "$name.xml";
+    }
+    for my $title (sort keys %{$state->{store}}) {
+        my $name = $title;
+        $name =~ s{([/\\%])}{sprintf("%%%02X", ord $1)}eg;
+        $changes += maybe_spew("$STORE/$name.xml", $state->{store}{$title});
+        push @files, "$STORE/$name.xml";
+    }
+    # add does nothing if nothing changed
+    git("add", "--", @files);
+    my $text = strftime("TiddlyWiki updated by '$FindBin::Script' at %Y-%m-%d %T %z", localtime());
+    git("commit", "-m", $text);
+}
 
 for my $file (@ARGV) {
-    my $string_in = slurp($file);
-    my $data = parse($parser, $string_in);
-
-    my $string_out = unparse($parser, $data);
-    print $string_out;
+    my $in = slurp($file);
+    my $state = {
+        content => $in,
+        store => {},
+        divs  => {},
+    };
+    my $template = parse(0, $state);
+    # print Dumper($state);
+    # print $template;
+    $state->{content} = $template;
+    my $out = parse(1, $state);
+    $in eq $out || die "Incorrect regeneration";
+    output($state, $template);
 }
