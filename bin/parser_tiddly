@@ -6,23 +6,25 @@ use feature qw(say);
 # Make sure to do: apt install w3c-sgml-lib
 our $VERSION = "1.000";
 
+use FindBin qw($Script);
+our $Bin;
+
 # If the program runs as /foobar/bin/program, find libraries in /foobar/lib
-my $base;
 BEGIN {
     # Even on windows FindBin uses / in the reported path
-    use FindBin ();
-    $FindBin::Bin =~
+    $Bin = $FindBin::Bin;
+    $Bin =~ s{/+\z}{};
+    $Bin =~
         ($^O eq "MSWin32" ?
          qr{^((?:[A-Z]:)?(?:/[a-zA-Z0-9_:.~ -]+)*)/[a-zA-Z0-9_.-]+/*\z} :
          qr{^((?:/[a-zA-Z0-9_:.-]+)*)/[a-zA-Z0-9_.-]+/*\z}) ||
-         die "Could not parse bin directory '$FindBin::Bin'";
+         die "Could not parse bin directory '$Bin'";
     # Use untainted version of lib
     require lib;
-    $base = $1;
-    "lib"->import(@ARGV && $ARGV[0] eq "--blib" ? shift && "$base/blib/lib" : "$base/lib");
+    # Support a simple --blib option for pre-install testing
+    "lib"->import(@ARGV && $ARGV[0] eq "--blib" ? shift && "$1/blib/lib" : "$1/lib");
 }
 
-print STDERR "Base=$base\n";
 $ENV{PATH} = "/usr/bin:/bin";
 delete @ENV{qw(IFS CDPATH ENV BASH_ENV)};
 
@@ -31,23 +33,25 @@ use Carp;
 use POSIX qw(strftime);
 use Sys::Hostname;
 use Fcntl qw(O_WRONLY O_CREAT O_TRUNC O_EXCL);
-use Errno qw(ENOENT ESTALE);
+use Errno qw(ENOENT ESTALE EEXIST);
 use File::Spec;
 use Getopt::Long 2.24 qw(:config bundling require_order);
-# use XML::Simple qw(:strict);
-#use XML::LibXML;
 use XML::Parser;
 use Data::Dumper;
 local $Data::Dumper::Sortkeys = 1;
 local $Data::Dumper::Indent = 1;
 
 use constant {
+    INFINITY	=> 9**9**9,
     MODE	=> 2,
     WHERE	=> "/html/body/div/",
-    INDEX	=> "index.html",
+    TEMPLATE	=> "template.html",
+    WIKI_STATE	=> "Wiki state",
+    EXPLODED	=> "exploded/",
 };
 
 my $STORE = "storeArea";
+my $EPOCH0 = "197001010000";
 
 defined(our $hostname = Sys::Hostname::hostname()) ||
     croak "Cannot determine hostname";
@@ -58,6 +62,42 @@ $hostname =~ s/\..*//s;
 $hostname =~ /^([a-zA-Z0-9_-]+)\z/ ||
     croak "Hostname '$hostname' looks too weird";
 $hostname = lc $1;
+
+my $git = 1;
+my $check = 1;
+my $sync = 1;
+my $strip = 1;
+die "Could not parse your command line. Try $0 -h\n" unless
+    GetOptions("git!"		=> \$git,
+               "check!"		=> \$check,
+               "strip!"		=> \$strip,
+               "sync!"		=> \$sync,
+               "m|message=s"	=> \my $git_message,
+               "e|edit!"	=> \my $edit,
+               "amend!"	=> \my $amend,
+               "v|verbose!"	=> \my $verbose,
+               "version!"	=> \my $version,
+               "U|unsafe!"	=> \my $unsafe,
+               "h|help!"	=> \my $help);
+
+if ($version) {
+    require Wiki::TiddlyWiki::Classic::Saver::Package;
+    ## no critic (UselessNoCritic RequireCheckedSyscalls)
+    print<<"EOF";
+tiddly_update $VERSION (Wiki::TiddlyWiki::Classic::Saver $Wiki::TiddlyWiki::Classic::Saver::Package::VERSION)
+EOF
+    exit 0;
+}
+if ($help) {
+    require Config;
+    $ENV{PATH} .= ":" unless $ENV{PATH} eq "";
+    $ENV{PATH} = "$ENV{PATH}$Config::Config{'installscript'}";
+    exit system("perldoc", "-F", $unsafe ? "-U" : (), "$Bin/$Script") ? 1 : 0;
+    # make parser happy
+    %Config::Config = ();
+}
+
+my $dir_tiddly = shift // die "No directory or file argument";
 
 # Import a complete file and return the contents as a single string
 sub slurp {
@@ -89,7 +129,7 @@ sub slurp {
 
 sub parent_dir {
     my ($volume, $directories) = File::Spec->splitpath(@_);
-    return File::Spec->catpath($volume, $directories eq "" ? "." : $directories, "");
+    return File::Spec->catpath($volume, $directories eq "" ? "./" : $directories, "");
 }
 
 sub fsync {
@@ -118,6 +158,8 @@ sub spew {
     my $file = shift;
     croak "filename is undefined" if !defined $file;
     defined || croak "undef value" for @_;
+
+    print STDERR "Writing $file\n" if $verbose;
 
     my $fsync = 1;
     my $binmode;
@@ -235,6 +277,34 @@ sub spew {
     return;
 }
 
+sub maybe_strip {
+    $strip || return;
+    for (@_) {
+        # Strip final newline
+        s/\n*\z/\n/;
+        # Strip trailing spaces
+        s/[^\S\n]+\n/\n/g;
+    }
+}
+
+sub files_add {
+    my ($dir, $seen) = @_;
+
+    my $path = $dir_tiddly . ($dir eq "." ? "" : "$dir/");
+    opendir(my $dh, $path) || die "Could not opendir '$path': $!";
+    while (my $f = readdir($dh)) {
+        next if $f =~ /^\./;
+        my $rel_path = $dir eq "." ? $f : "$dir/$f";
+        # my @stat = lstat("$path$f") or do {
+        my @stat = stat("$path$f") or do {
+            next if $! == ENOENT || $! == ESTALE;
+            die "Could not lstat '$path$f': $!";
+        };
+        ++$seen->{$rel_path} if -f _;
+    }
+    closedir($dh) || die "Could not closedir '$path': $!";
+}
+
 sub handle {
     my ($out, $state, $start, $parser, $elt, %attr) = @_;
 
@@ -282,6 +352,7 @@ sub handle {
                     }
                 } else {
                     $chunk = $state->{divs}{$id};
+                    $state->{divs}{$id} = $chunk = slurp($$chunk, binmode => 1) if ref $chunk eq "SCALAR";
                     $chunk =~ s/\n\z// ||
                         die "Chunk '$id' does not end in \\n";
                 }
@@ -339,54 +410,342 @@ sub parse {
 }
 
 sub git {
-    my $rc = system("git", @_);
-    die "Unexpected exit code $rc from git @_" if $rc;
+    my @command;
+    for my $arg (@_) {
+        defined $arg || croak "Assertion: Undefined argument";
+        last if $arg eq "--";
+        push @command, $arg;
+    }
+    @command || croak "Assertion: No git command";
+    $git || croak "Assertion: Must not use 'git @command' with git turned off";
+
+    print STDERR "git @command\n" if $verbose;
+
+    my $pid = open(my $fh, "-|") // die "Could not fork: $!";
+    if (!$pid) {
+        # Child
+        chdir($dir_tiddly) || die "Could not change to '$dir_tiddly': $!";
+        $git > 0 || open(STDERR, ">", "/dev/null") ||
+            die "Could not redirect STDERR to /dev/null: $!";
+        exec("git", @_);
+        die "Could not exec git: $!";
+    }
+    my @out;
+    local $_;
+    while (<$fh>) {
+        s{\Q$/}{} || die "Unterminated output line from 'git @command'";
+        push @out, $_;
+    }
+    close($fh);
+    croak "Unexpected exit code $? from git @command" if
+        $? && !(@out && $out[-1] =~ /^(?:no changes|nothing)\s.*\s*\z/im);
+    return $? ? () : @out;
+}
+
+sub maybe_git {
+    my $old = $git;
+    $git = -1;
+    my @out = eval { git(@_) };
+    $git = $old;
+    return @out;
+}
+
+sub git_files {
+    local $/ = "\0";
+    return git("ls-files", "-z");
+}
+
+sub git_check {
+    !$git || maybe_git("rev-parse", "--git-dir") ||
+        die "Directory $dir_tiddly is not within a git repository\n";
+}
+
+sub git_revision {
+    my ($revision) = (maybe_git("rev-parse", "HEAD"), "");
+    return $revision;
+}
+
+# A git revision can have multiple roots.
+# We arbitrarily select the oldest and break ties on revision id
+sub git_revision_first {
+    my $old = $git;
+    $git = -1;
+    my $first_revision = "";
+    eval {
+        my $first_time = INFINITY;
+        # Get the roots
+        my @revs = git("rev-list", "--max-parents=0", "HEAD");
+        # And find the oldest
+        for my $rev (sort @revs) {
+            my ($time) = git("show", "-s", "--format=%ct", $rev);
+            $time || next;
+            if ($time < $first_time) {
+                $first_time     = $time;
+                $first_revision = $rev;
+            }
+        }
+    };
+    $git = $old;
+    return $first_revision;
 }
 
 sub maybe_spew {
-    my ($file, $content) = @_;
-    die "Bad file '$file'" if $file =~ m{(?:^|/)\.};
+    my ($dir, $file, $content) = @_;
+    if (defined $dir) {
+        die "Bad file '$file'" if $file =~ m{(?:^|/)\.};
+        $file = $dir . $file;
+    }
 
-    my $old = slurp($file, maybe_gone => 1);
+    my $old = slurp($file, maybe_gone => 1, binmode => 1);
     my $changed = 0;
     if (defined $old && $old eq $content) {
         # print STDERR "Not updating $file\n";
     } else {
-        spew($file, { fsync => 0, atomic => 1 }, $content);
+        spew($file, { fsync => 0, atomic => 1, binmode => 1 }, $content);
         $changed = 1;
     }
     return $changed;
 }
 
-sub output {
+sub escape {
+    my ($string) = @_;
+
+    croak "High bytes not supported (yet)" if $string =~ /[^\0-\xff]/;
+    croak "Null byte" if $string =~ /\0/;
+    $string =~ s{([/\\%;'])}{sprintf("%%%02X", ord $1)}eg;
+    return $string;
+}
+
+sub unescape {
+    my ($string) = @_;
+
+    croak "High bytes not supported (yet)" if $string =~ /[^\0-\xff]/;
+    $string =~ s{%([0-9a-fA-F]{2})}{chr hex $1}eg;
+    croak "Null byte" if $string =~ /\0/;
+    return $string;
+}
+
+sub explode {
     my ($state, $template) = @_;
 
+    my %seen;
+    @seen{git_files()} = () if $git;
+    files_add(".", \%seen);
+    files_add($STORE, \%seen);
+
+    my $revision;
+    if (exists $state->{store}{WIKI_STATE()}) {
+        $revision = lc $2 if
+            $state->{store}{WIKI_STATE()} =~ s/^([^\S\n]*)Revision:[^\S\n]*([0-9a-f]{40})[^\S\n]*\n/$1Revision: XXXX\n/im;
+    }
+    my $cur_revision = git_revision();
+    if ($revision) {
+        # print "Revision=$revision\n";
+        if ($cur_revision && lc $cur_revision ne $revision) {
+            die "Exploding wiki at revision $revision, but git is at $cur_revision\n" if $git;
+            warn "Warning: Exploding wiki at revision $revision, but git is at $cur_revision\n";
+        }
+    }
+
     my @files;
-    my $dir = "../TiddlyWiki";
-    chdir($dir) || die "Could not change to '$dir': $!";
     my $changes = 0;
-    $changes += maybe_spew("template.html", $template);
-    push @files, "template.html";
+    $changes += maybe_spew($dir_tiddly, TEMPLATE, $template);
+    push @files, TEMPLATE;
     for my $id (sort keys %{$state->{divs}}) {
-        my $name = $id;
-        $name =~ s{([/\\%])}{sprintf("%%%02X", ord $1)}eg;
-        $changes += maybe_spew("$name.xml", $state->{divs}{$id});
+        my $name = escape($id);
+        $changes += maybe_spew($dir_tiddly, "$name.xml", $state->{divs}{$id});
         push @files, "$name.xml";
     }
     for my $title (sort keys %{$state->{store}}) {
-        my $name = $title;
-        $name =~ s{([/\\%])}{sprintf("%%%02X", ord $1)}eg;
-        $changes += maybe_spew("$STORE/$name.xml", $state->{store}{$title});
+        next if $title eq WIKI_STATE();
+        my $name = escape($title);
+        $changes += maybe_spew($dir_tiddly, "$STORE/$name.xml", $state->{store}{$title});
         push @files, "$STORE/$name.xml";
     }
-    # add does nothing if nothing changed
-    git("add", "--", @files);
-    my $text = strftime("TiddlyWiki updated by '$FindBin::Script' at %Y-%m-%d %T %z", localtime());
-    git("commit", "-m", $text);
+    print STDERR "Added $changes files\n" if $verbose;
+
+    # Delete any spurious files
+    delete @seen{@files};
+    if (my @seen = sort keys %seen) {
+        print STDERR "Deleting files\n";
+        if ($git) {
+            # rm does nothing if the file is not in git
+            git("rm", "-q", "--ignore-unmatch", "--", @seen);
+        }
+        # Delete any files that were not in git
+        for my $file (@seen) {
+            if (unlink("$dir_tiddly$file")) {
+                print STDERR "Deleted $dir_tiddly$file\n" if $verbose;
+            } else {
+                $! == ENOENT || $! == ESTALE ||
+                    die "Could not unlink '$dir_tiddly$file': $!";
+            }
+        }
+    } else {
+        print STDERR "Deleted 0 files\n" if $verbose;
+    }
+
+    my $new_revision;
+    if ($git) {
+        # add does nothing if nothing changed
+        git("add", "--", @files);
+        my $date = strftime("%Y-%m-%d %T %z", localtime());
+        $git_message ||= "TiddlyWiki update on $hostname using '$Script'";
+        # commit does nothing if nothing changed
+        git("commit", "-q", "-m", $git_message,
+            $edit   ? "--edit"   : (),
+            $amend ? "--amend" : ());
+        $new_revision = git_revision();
+        print STDERR "Committed changes\n" if $cur_revision ne $new_revision;
+    } else {
+        $new_revision = $cur_revision;
+    }
+    return $cur_revision, $new_revision;
 }
 
-for my $file (@ARGV) {
-    my $in = slurp($file);
+sub update_wiki_state {
+    my ($state, $default_wiki_state) = @_;
+
+    my ($user_name) = maybe_git("config", "user.name");
+    $user_name ||= "Unknown";
+    $user_name !~ /([\0&"<])/ || die "Bad char '$1' in user.name '$user_name'";
+    my $wiki_state = $state->{store}{WIKI_STATE()} // $default_wiki_state // <<"EOT"
+<div title="Wiki state" creator="$user_name" modifier="$user_name" created="$EPOCH0" modified="$EPOCH0" tags="Internal" changecount="0">
+<pre>{{{
+Revision: XXXX
+}}}</pre>
+</div>
+EOT
+        ;
+    if (my $cur_revision = git_revision()) {
+        $wiki_state =~ s/^([^\S\n]*)Revision:.*\n/$1Revision: $cur_revision\n/im || croak "Could not find Revision in $wiki_state";
+        my $n = my ($author, $time) = maybe_git("show", "-s", "--format=%an%n%ct", "HEAD");
+        $n == 2 || croak "Could not 'git show' while I could get the revision";
+        $author eq "" ||
+            $wiki_state =~ s/^(<div\s.*\smodifier)="[^"]*"/$1="$user_name"/ ||
+            croak "Could not find modifier in $wiki_state";
+        if ($time ne "") {
+            my $date = strftime("%Y%m%d%H%M", gmtime($time));
+            $wiki_state =~ s/^(<div\s.*\smodified)="\d+"/$1="$date"/ ||
+                croak "Could not find modified in $wiki_state";
+        }
+        my ($count) = maybe_git("rev-list", "--count", "HEAD") or
+            croak "Could not get git count while I could get the revision";
+        !$count ||
+            $wiki_state =~ s{(<div\s.*\schangecount)="(\d+)"}{$1="$count"} or
+            croak "Could not find changecount in $wiki_state";
+
+        my $first_revision = git_revision_first() ||
+            croak "Could not first git revision while I could get the revision";
+        $n = ($author, $time) = maybe_git("show", "-s", "--format=%an%n%ct", $first_revision);
+        $n == 2 || croak "Could not 'git show' while I could get the revision";
+        $author eq "" ||
+            $wiki_state =~ s/^(<div\s.*\screator)="[^"]*"/$1="$user_name"/ ||
+            croak "Could not find creator in $wiki_state";
+        if ($time ne "") {
+            my $date = strftime("%Y%m%d%H%M", gmtime($time));
+            $wiki_state =~ s/^(<div\s.*\screated)="\d+"/$1="$date"/ ||
+                croak "Could not find created in $wiki_state";
+        }
+    }
+    $state->{store}{WIKI_STATE()} = $wiki_state;
+}
+
+sub implode {
+    my ($wiki_state) = @_;
+
+    my %files;
+    if ($git) {
+        @files{git_files()} = ();
+        exists $files{TEMPLATE()} ||
+            die "File '", TEMPLATE, "' is not in git\n";
+    } else {
+        files_add(".", \%files);
+        files_add($STORE, \%files);
+        exists $files{TEMPLATE()} ||
+            die "File '$dir_tiddly", TEMPLATE, "' does not exist\n";
+    }
+    delete $files{TEMPLATE()};
+
+    my $state = {
+        content => slurp($dir_tiddly . TEMPLATE, binmode => 1),
+        store => {},
+        divs  => {},
+    };
+    for my $file (sort keys %files) {
+        if (my ($id) = $file =~ m{^([^/]+)\.xml\z}) {
+            $state->{divs}{unescape($id)} = \($dir_tiddly . $file);
+        } elsif (my ($title) = $file =~ m{^\Q$STORE\E/([^/]+)\.xml\z}o) {
+            $state->{store}{unescape($title)} = slurp($dir_tiddly . $file, binmode => 1);
+        } else {
+            print STDERR "Ignoring unexpected file '$file'\n";
+        }
+    }
+
+    update_wiki_state($state, $wiki_state);
+
+    my $out = parse(1, $state);
+    for my $id (sort keys %{$state->{divs}}) {
+        die "div id '$id' was not used" if ref $state->{divs}{$id} ne "";
+    }
+    maybe_strip($out);
+    return $out;
+}
+
+sub diff {
+    my ($from, $to) = @_;
+
+    my $file_from = $dir_tiddly . "from";
+    my $file_to   = $dir_tiddly . "to";
+    eval {
+        spew($file_from, { fsync => 0, binmode => 1 }, $from);
+        spew($file_to,   { fsync => 0, binmode => 1 }, $to);
+        system("diff", "-u", "--", $file_from, $file_to);
+    };
+    if (my $err = $@) {
+        for my $file ($file_from, $file_to) {
+            unlink($file) || $! == ENOENT || $! == ESTALE ||
+                warn("Could not unlink '$file': $!");
+        }
+        die $err;
+    }
+}
+
+my $file;
+if (-d $dir_tiddly) {
+    $dir_tiddly =~ s{/*\z}{/};
+
+    if (!@ARGV) {
+        # Check if git will work at all
+        git_check();
+
+        print implode();
+        exit 0;
+    }
+    $file = shift;
+    stat($file) || die "Could not stat '$file': $!";
+}
+die "Too many arguments" if @ARGV;
+if (-f _) {
+    if (!defined $file) {
+        $file = $dir_tiddly;
+        $dir_tiddly = parent_dir($file) . EXPLODED;
+    }
+    if (!-d "$dir_tiddly$STORE") {
+        die "Path '$dir_tiddly$STORE' exists but is not a directory" if -e _;
+        mkdir($dir_tiddly) || $! == EEXIST ||
+            die "Could not create directory '$dir_tiddly': $!";
+        mkdir("$dir_tiddly$STORE") || $! == EEXIST ||
+            die "Could not create directory '$dir_tiddly$STORE': $!";
+    }
+
+    # Check if git will work at all
+    git_check();
+
+    my $in = slurp($file, binmode => 1);
+    maybe_strip($in);
+
+    # Split up current wiki
     my $state = {
         content => $in,
         store => {},
@@ -395,8 +754,223 @@ for my $file (@ARGV) {
     my $template = parse(0, $state);
     # print Dumper($state);
     # print $template;
-    $state->{content} = $template;
-    my $out = parse(1, $state);
-    $in eq $out || die "Incorrect regeneration";
-    output($state, $template);
+
+    if ($check) {
+        # Convert current state back single html
+        $state->{content} = $template;
+        my $out = parse(1, $state);
+
+        # Check that the roundtrip changes nothing
+        $in eq $out || die "Incorrect regeneration:\n", diff($in, $out);
+    }
+
+    # Commit changes
+    my ($revision_old,$revision_commit) = explode($state, $template);
+    my $activity = $revision_old ne $revision_commit;
+    my $cur_revision = $revision_commit;
+
+    if ($git) {
+        # Update remote
+        if ($sync && git("remote")) {
+            git("pull");
+            if (my @conflict = git("diff", "--name-only", "--diff-filter=U")) {
+                die "Merge conflict. Please fix:\n", map "  $_\n", @conflict;
+            }
+            $cur_revision = git_revision();
+            if ($cur_revision ne $revision_commit) {
+                $activity ||= 1;
+                print STDERR "Pulled changes\n";
+            }
+            git("push", "-q");
+        } else {
+            print STDERR $sync ?
+                "Skipping git pull/push since no remote was set\n" :
+                "Skipping git pull/push as requested\n";
+        }
+    }
+
+    # Create new wiki (in case commit/pull changed something)
+    if ($revision_old ne $cur_revision || !$check) {
+        my $out = implode($state->{store}{WIKI_STATE()});
+        my $changed = maybe_spew(undef, $file, $out);
+        if ($changed) {
+            $activity ||= 1;
+            print STDERR "Updated '$file'. Please reload you wiki\n";
+        }
+    }
+    print STDERR "No changes\n" if !$activity;
+} else {
+    die defined $file ?
+        "$file is not a file nor a directory" :
+        "$dir_tiddly is neither a file nor a directory";
 }
+
+__END__
+
+=head1 NAME
+
+tiddly_update - Explode and implode a classic TiddlyWiki
+
+=head1 SYNOPSIS
+
+ tiddly_update [--version] [--unsafe] [-U] [-h] [--help]
+ tiddly_update [--no-git] [--verbose] [--no-strip] <dir>
+ tiddly_update [--no-git] [--verbose] [--no-strip] [--no-check] [--no-sync] [-m <message>] [-e] [<dir>] <file>
+
+=head1 DESCRIPTION
+
+If given a directory it will build a wiki file from that and print that to
+C<STDOUT>. You can use that to manually generate an initial wiki file from the
+git repository.
+
+If given a file B<tiddly_update> will assume this is a tiddly wiki classic file,
+split it up in parts into directory given by the optional C<dir> argument or into subdirectory F<exploded> found relative to the given file (B<not> relative to
+the current directory) and commit that to git. If there is a git remote it will
+then pull from the remote followed by a push to the remote.
+Then the wiki file is rebuilt.
+Notice that the given directory (and subdirectories) will be created if needed
+but no git repository is automatically created.
+
+The current git revision is stored inside the new wiki file
+(in tiddler C<Wiki State>). The program will also do nothing if the revision
+inside the file is different from the current revision.
+
+You can fix this by manually changing that tiddler, save the wiki and running the B<tiddly_update> on the saved file. This will update git to reflect the wiki file.
+
+Or instead you can run B<tiddly_update> on the base directory and redirect the
+output to the wiki file and reload the file in your browser. This will update
+the wiki file to reflect git.
+
+The revision check also means you should usually not do git actions that change
+the revision number (like C<commit> and C<pull>) outside this program. The
+program will commit anything that is in the git index, so you are free to do
+changes in the working directory and update the git index after which you can
+run this progrtam to do the git commit (possibly using the L<edit|/edit> and/or
+L<message|/message> options).
+
+=head1 OPTIONS
+
+=over 4
+
+=item X<verbose>-v, --verbose
+
+Show more about the steps taken
+
+=item X<git>--git
+
+Use git (the default).
+
+Giving the corresponding C<no> option does not mean that
+the git program won't be called, it just means that the git state will not be
+changed (no add, remove, commit, push or pull) and that any git errors
+(including git itself not being found or able to run) will be ignored. Notice
+that it may delete files from the filesystem even though these files are in git.
+
+=item X<check>--check
+
+Before splitting up the wiki file make sure that when reproducing the the wiki
+file from the parts this gives a byte for byte identical result. Otherwise
+change nothing exit with an error message.
+
+This check is the default. Turning it of with the corresponding C<no> option
+makes the program progress anyways and will change the wiki file. This may allow
+for some implicit repairs, but it's probably safest to manually backup the wiki
+file first and carefully check the canges.
+
+=item X<strip>--strip
+
+If true (the default), strip trailing spaces from all lines, not just from the
+tiddlers but also from the internal wiki template.
+
+=item X<message>--message, -m <message>
+
+Use C<message> as git commit message instead of the autogenerated one
+
+=item X<edit>--edit, -e
+
+Allows you to edit the commit message (if a commit is done)
+
+=item X<edit>--amend
+
+Amend the current commit. Take care when using this dangerous option.
+
+If you plan to use this best make sure that the previous commit did not do a
+push (see the L<--no-sync|/sync> option) or use L<--no-sync|/sync> with the
+current invocation and do a manual C<git push -f> at some point in the future
+if you are sure you won't destroy unimported updates on the remote or confuse
+other users of the remote.
+
+=item X<sync>--sync
+
+If true (the default) pull and push the repository (if a remote has been set).
+This option exists mostly so you can do C<--no-sync> to avoid this.
+
+=item X<help>-h, --help
+
+Show this help.
+
+=item X<unsafe>-U, --unsafe
+
+Allow even root to run the perldoc.
+Remember, the reason this is off by default is because it B<IS> unsafe.
+
+=item X<version>--version
+
+Print version info.
+
+=back
+
+=head1 EXAMPLE
+
+A typical use would be:
+
+  # Normal use
+  tiddly_update index.html
+
+  # Generate a new wiki from the current expansion
+  tiddly_update exploded > index.html
+
+As mentioned the program will not set up git for you. So if you have a wiki but
+no git yet:
+
+  # Go to the directory with the wiki, assumed to be called index.html
+  git init
+
+  # I like to have an empty commit at the root:
+  # git commit --allow-empty -m 'Initial empty commit'
+
+  # Possibly do tiddly_update on an empty tiddlywiki:
+  # tiddly_update exploded path_to_empty.html
+
+  # Commit your wiki:
+  tiddly_update index.html
+
+  # Possibly set up a remote, do an initial git push
+
+If you have an exploded wiki in git but no wiki yet:
+
+  git clone repository
+  cd directory
+  tiddly_update exploded > index.html
+
+=head1 BUGS
+
+None known
+
+=head1 SEE ALSO
+
+L<git(1)>,
+
+=head1 AUTHOR
+
+Ton Hospel, E<lt>tiddly_update@ton.iguana.beE<gt>
+
+=head1 COPYRIGHT AND LICENSE
+
+Copyright (C) 2019 by Ton Hospel
+
+This library is free software; you can redistribute it and/or modify
+it under the same terms as Perl itself, either Perl version 5.8.2 or,
+at your option, any later version of Perl 5 you may have available.
+
+=cut
