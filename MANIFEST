@@ -1,0 +1,11 @@
+Changes
+MANIFEST
+Makefile.PL
+README
+bin/tiddly_update
+lib/Wiki/TiddlyWiki/Classic/Saver/Package.pm
+md5-versions
+t/00_load.t
+t/01_syntax.t
+t/TestDrive.pm
+version_check
