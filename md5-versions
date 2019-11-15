@@ -1,17 +1,17 @@
-# Generated on 2019-10-30 17:23:22 UT using /usr/local/bin/release_pm
+# Generated on 2019-11-15 14:25:25 UT using /usr/local/bin/release_pm
 BEGIN
 SEMANTICS	1.013
 DIGITS		3
 RELEASE		1.000
-SUB_RELEASE	026
-DATE		2019-10-30 17:23:22
+SUB_RELEASE	027
+DATE		2019-11-15 14:25:25
 VCS_CHECK	1
-VERSION	7078683e10269afeaa6b1563fab025c2 1.000 Changes
+VERSION	5f2a1d058d0b0003f54a5cabe443e012 1.000 Changes
 VERSION	1873365953e3862fe27bfb93c3d5cd3b 1.000 MANIFEST
 VERSION	fd7f3ef250ee78eb4a0c3cf9b2588712 1.000 Makefile.PL
 VERSION	28c08f8ed5f92f7317f0e27b8d132ba7 1.000 README
-VERSION	26362b0876bddbaf6015e9183fd339f7 1.000 bin/tiddly_update
-VERSION	ca9808785abbb263006e9a2265fd4c1d 1.000 lib/Wiki/TiddlyWiki/Classic/Saver/Package.pm
+VERSION	b552d3d34bd7baebea76f0b22af09b9c 1.000 bin/tiddly_update
+VERSION	76edbc9855236aea65683e12fc4f36d7 1.000 lib/Wiki/TiddlyWiki/Classic/Saver/Package.pm
 VERSION	d66f416c17d1c5fba6f0275fa562e0fc 1.000 t/00_load.t
 VERSION	1dd6e09b5affc6dce2b6a2c3a3dcdbb3 1.000 t/01_syntax.t
 VERSION	4518fb46dd1d055dbdc20f74b47ae1e2 1.000 t/TestDrive.pm

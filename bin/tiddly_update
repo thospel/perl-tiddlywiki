@@ -633,8 +633,8 @@ EOT
         ;
 
     $version = Wiki::TiddlyWiki::Classic::Saver::Package->VERSION();
-    $wiki_state =~ s/^([^\S\n]*)Updater:.*\n/$1Updater: $Script $version\n/im ||
-        die "Could not find Updater in $wiki_state";
+    $wiki_state =~ s/^([^\S\n]*)Updater:.*\n/$1Updater: $Script $version\n/im or
+        $wiki_state .= "Updater: $Script $version\n";
 
     if (my $cur_revision = git_revision()) {
         $wiki_state =~ s/^([^\S\n]*)Revision:.*\n/$1Revision: $cur_revision\n/im || croak "Could not find Revision in $wiki_state";
