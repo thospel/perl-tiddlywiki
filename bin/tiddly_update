@@ -41,13 +41,16 @@ use Data::Dumper;
 local $Data::Dumper::Sortkeys = 1;
 local $Data::Dumper::Indent = 1;
 
+use Wiki::TiddlyWiki::Classic::Saver::Package;
+
 use constant {
-    INFINITY	=> 9**9**9,
-    MODE	=> 2,
-    WHERE	=> "/html/body/div/",
-    TEMPLATE	=> "template.html",
-    WIKI_STATE	=> "Wiki state",
-    EXPLODED	=> "exploded/",
+    INFINITY	 => 9**9**9,
+    MODE	 => 2,
+    WHERE	 => "/html/body/div/",
+    TEMPLATE	 => "template.html",
+    WIKI_STATE	 => "Wiki state",
+    EXPLODED	 => "exploded/",
+    DEFAULT_FILE => "index.html",
 };
 
 my $STORE = "storeArea";
@@ -81,7 +84,6 @@ die "Could not parse your command line. Try $0 -h\n" unless
                "h|help!"	=> \my $help);
 
 if ($version) {
-    require Wiki::TiddlyWiki::Classic::Saver::Package;
     ## no critic (UselessNoCritic RequireCheckedSyscalls)
     print<<"EOF";
 tiddly_update $VERSION (Wiki::TiddlyWiki::Classic::Saver $Wiki::TiddlyWiki::Classic::Saver::Package::VERSION)
@@ -97,7 +99,7 @@ if ($help) {
     %Config::Config = ();
 }
 
-my $dir_tiddly = shift // die "No directory or file argument";
+my $dir_tiddly = shift // DEFAULT_FILE;
 
 # Import a complete file and return the contents as a single string
 sub slurp {
@@ -533,10 +535,12 @@ sub explode {
     files_add(".", \%seen);
     files_add($STORE, \%seen);
 
-    my $revision;
+    my ($revision, $updater);
     if (exists $state->{store}{WIKI_STATE()}) {
         $revision = lc $2 if
             $state->{store}{WIKI_STATE()} =~ s/^([^\S\n]*)Revision:[^\S\n]*([0-9a-f]{40})[^\S\n]*\n/$1Revision: XXXX\n/im;
+        $updater = $2 if
+            $state->{store}{WIKI_STATE()} =~ s/^([^\S\n]*)Updater:[^\S\n]*(.*?)[^\S\n]*\n/$1Updater: XXXX\n/im;
     }
     my $cur_revision = git_revision();
     if ($revision) {
@@ -545,6 +549,15 @@ sub explode {
             die "Exploding wiki at revision $revision, but git is at $cur_revision\n" if $git;
             warn "Warning: Exploding wiki at revision $revision, but git is at $cur_revision\n";
         }
+    }
+    if (defined $updater) {
+        # This check is purely local since the wiki state is not stored in git
+        # So it only makes sure you didn't regress this script
+        my ($program, $version) = $updater =~ /^(\S+)\s+(\S+)$/ or
+            die "Could not parse Updater '$updater' in tiddler @{[WIKI_STATE]}\n";
+        $program eq $Script ||
+            die "Unknown program '$program' in tiddler @{[WIKI_STATE]}\n";
+        Wiki::TiddlyWiki::Classic::Saver::Package->VERSION($version);
     }
 
     my @files;
@@ -613,10 +626,16 @@ sub update_wiki_state {
 <div title="Wiki state" creator="$user_name" modifier="$user_name" created="$EPOCH0" modified="$EPOCH0" tags="Internal" changecount="0">
 <pre>{{{
 Revision: XXXX
+Updater: XXXX
 }}}</pre>
 </div>
 EOT
         ;
+
+    $version = Wiki::TiddlyWiki::Classic::Saver::Package->VERSION();
+    $wiki_state =~ s/^([^\S\n]*)Updater:.*\n/$1Updater: $Script $version\n/im ||
+        die "Could not find Updater in $wiki_state";
+
     if (my $cur_revision = git_revision()) {
         $wiki_state =~ s/^([^\S\n]*)Revision:.*\n/$1Revision: $cur_revision\n/im || croak "Could not find Revision in $wiki_state";
         my $n = my ($author, $time) = maybe_git("show", "-s", "--format=%an%n%ct", "HEAD");
@@ -815,7 +834,7 @@ tiddly_update - Explode and implode a classic TiddlyWiki
 
  tiddly_update [--version] [--unsafe] [-U] [-h] [--help]
  tiddly_update [--no-git] [--verbose] [--no-strip] <dir>
- tiddly_update [--no-git] [--verbose] [--no-strip] [--no-check] [--no-sync] [-m <message>] [-e] [<dir>] <file>
+ tiddly_update [--no-git] [--verbose] [--no-strip] [--no-check] [--no-sync] [-m <message>] [-e] [<dir>] [<file>]
 
 =head1 DESCRIPTION
 
@@ -830,6 +849,9 @@ then pull from the remote followed by a push to the remote.
 Then the wiki file is rebuilt.
 Notice that the given directory (and subdirectories) will be created if needed
 but no git repository is automatically created.
+
+If neither file or directory is given it behaves as if you gave F<index.html>
+as file argument
 
 The current git revision is stored inside the new wiki file
 (in tiddler C<Wiki State>). The program will also do nothing if the revision
