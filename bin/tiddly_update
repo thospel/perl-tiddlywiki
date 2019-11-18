@@ -307,16 +307,46 @@ sub files_add {
     closedir($dh) || die "Could not closedir '$path': $!";
 }
 
+# $mode can be:
+# 0: explode, no script filter
+# 1: implode, no script filter
+# 2: implode, script filter
+# 3: no plode, script filter
 sub handle {
-    my ($out, $state, $start, $parser, $elt, %attr) = @_;
+    my ($mode, $state, $start, $parser, $elt, %attr) = @_;
 
-    $elt eq "div" || return;
+    $elt eq "div" && $mode != 3 || $elt eq "script" && $mode > 1 || return;
+
     my @context = $parser->context;
-    @context >= 2 && @context <= 3 && $context[1] eq "body" && $context[0] eq "html" || return;
-    if (@context == 3) {
-        $context[2] eq "div" || return;
-        my $id = $state->{div_key} // return;
-        $id eq $STORE || return;
+    if ($elt eq "script") {
+        my @context = $parser->context;
+        @context == 2 && $context[1] eq "head" && $context[0] eq "html" ||
+            return;
+        # don't process script inside <div>
+        !defined $state->{div_key} ||
+            die "Assertion: Cannot be inside div at this level";
+        if ($start) {
+            !defined $state->{script_string} || die "Assertion: Multiple start";
+            exists $attr{type} && $attr{type} eq "text/javascript" || do {
+                $state->{script_string} = "";
+                return;
+            };
+        } else {
+            defined $state->{script_string} || die "Assertion: Missing start";
+            if ($state->{script_string} eq "") {
+                $state->{script_string} = undef;
+                return;
+            }
+        }
+    } elsif ($elt eq "div") {
+        @context >= 2 && @context <= 3 && $context[1] eq "body" && $context[0] eq "html" || return;
+        if (@context == 3) {
+            $context[2] eq "div" || return;
+            my $id = $state->{div_key} // return;
+            $id eq $STORE || return;
+        }
+    } else {
+        die "Assertion: Impossible element '$elt'";
     }
 
     my $original_string = $parser->original_string;
@@ -326,12 +356,30 @@ sub handle {
     my $chunk = substr($state->{content}, 0, $end, "");
     $state->{offset} += $end;
     my $line = $parser->current_line;
+
+    if ($elt eq "script") {
+        if ($start) {
+            substr($chunk, $current_byte, $len, "");
+            $state->{template} .= $chunk;
+            $state->{script_string} = $original_string;
+        } else {
+            if ($state->{script_seen}{$chunk}++) {
+                ++$state->{changes};
+            } else {
+                $state->{template} .= $state->{script_string};
+                $state->{template} .= $chunk;
+            }
+            $state->{script_string} = undef;
+        }
+        return;
+    }
+
     if (@context == 2) {
         if ($start) {
             my $id = $attr{id} // die "$elt: No id at line $line\n";
             !defined $state->{div_key} || die "Assertion: $elt: id '$id' while active '$state->{div_key}' at line $line";
             $state->{div_key} = $id;
-            if ($out) {
+            if ($mode > 0) {
                 if ($id ne $STORE) {
                     substr($chunk, $current_byte, $len, "");
                 }
@@ -343,7 +391,7 @@ sub handle {
             my $id = $state->{div_key} //
                 die "Assertion: $elt: end without id at line $line";
             $state->{div_key} = undef;
-            if ($out) {
+            if ($mode > 0) {
                 if ($id eq $STORE) {
                     for my $title (sort keys %{$state->{store}}) {
                         my $chunk = $state->{store}{$title};
@@ -366,7 +414,7 @@ sub handle {
             }
         }
     } else {
-        !$out || die "Parsing $STORE in out";
+        $mode == 0 || die "Parsing $STORE in out";
         # Due to the tests above we are in id $STORE
         if ($start) {
             my $title = $attr{title} // die "$elt: No title at line $line\n";
@@ -386,28 +434,32 @@ sub handle {
 }
 
 sub parse {
-    my ($out, $state) = @_;
+    my ($mode, $state) = @_;
 
+    $state->{changes} = 0;
     $state->{offset} = 0;
     $state->{template}  = "";
     $state->{div_key}   = undef;
     $state->{store_key} = undef;
+    $state->{script_seen} = {};
+    $state->{script_string} = undef;
 
     my $p1 = XML::Parser->new(Handlers => {
-        Start   => sub { handle($out, $state, 1, @_) },
-        End	=> sub { handle($out, $state, 0, @_) },
+        Start   => sub { handle($mode, $state, 1, @_) },
+        End	=> sub { handle($mode, $state, 0, @_) },
     });
     my $content = $state->{content};
     $p1->parse($content);
-    if ($out) {
+    if ($mode) {
         !defined $state->{divs}{$STORE} || die "Unexpected $STORE";
     } else {
         delete $state->{divs}{$STORE} || die "No $STORE";
     }
     !defined delete $state->{store_key} || die "store still active";
     !defined delete $state->{div_key} || die "div still active";
+    !defined delete $state->{script_string} || die "script still active";
     $state->{template} .= delete $state->{content};
-    delete $state->{offset};
+    delete @$state{qw(offset script_seen)};
     return delete $state->{template};
 }
 
@@ -580,7 +632,7 @@ sub explode {
     # Delete any spurious files
     delete @seen{@files};
     if (my @seen = sort keys %seen) {
-        print STDERR "Deleting files\n";
+        print STDERR "Deleting files @seen\n";
         if ($git) {
             # rm does nothing if the file is not in git
             git("rm", "-q", "--ignore-unmatch", "--", @seen);
@@ -633,8 +685,8 @@ EOT
         ;
 
     $version = Wiki::TiddlyWiki::Classic::Saver::Package->VERSION();
-    $wiki_state =~ s/^([^\S\n]*)Updater:.*\n/$1Updater: $Script $version\n/im or
-        $wiki_state .= "Updater: $Script $version\n";
+    $wiki_state =~ s/^([^\S\n]*)Updater:.*\n/$1Updater: $Script $version\n/im ||
+        $wiki_state =~ s/^([^\S\n]*Revision:.*\n)/$1Updater: $Script $version\n/im || croak "Could not find Revision in $wiki_state";
 
     if (my $cur_revision = git_revision()) {
         $wiki_state =~ s/^([^\S\n]*)Revision:.*\n/$1Revision: $cur_revision\n/im || croak "Could not find Revision in $wiki_state";
@@ -703,7 +755,8 @@ sub implode {
 
     update_wiki_state($state, $wiki_state);
 
-    my $out = parse(1, $state);
+    my $out = parse(2, $state);
+    warn("Removed duplicate javascript on implode\n") if $state->{changes};
     for my $id (sort keys %{$state->{divs}}) {
         die "div id '$id' was not used" if ref $state->{divs}{$id} ne "";
     }
@@ -781,6 +834,22 @@ if (-f _) {
 
         # Check that the roundtrip changes nothing
         $in eq $out || die "Incorrect regeneration:\n", diff($in, $out);
+    }
+
+    # Filter duplicate javascript in template
+    if (1) {
+        my $re_state = {
+            content => $template,
+            store => {},
+            divs  => {},
+        };
+        my $out = parse(3, $re_state);
+        if ($re_state->{changes}) {
+            warn("Removed duplicate javascript on explode. '$file' is unchanged.\n");
+            $template = $out;
+        } elsif ($template ne $out) {
+            die "Assertion: parser claims to have changed nothing but the result is different";
+        }
     }
 
     # Commit changes
