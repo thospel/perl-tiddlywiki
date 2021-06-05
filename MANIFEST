@@ -2,6 +2,7 @@ Changes
 MANIFEST
 Makefile.PL
 README
+README.md
 bin/tiddly_update
 lib/Wiki/TiddlyWiki/Classic/Saver/Package.pm
 md5-versions

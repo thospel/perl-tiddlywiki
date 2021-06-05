@@ -4,7 +4,6 @@ use strict;
 use warnings;
 use ExtUtils::MakeMaker;
 use FindBin;
-use Config qw(%Config);
 
 our $VERSION = '1.000';
 
@@ -17,12 +16,33 @@ my @programs_to_install;
 
 if (!$opt_n || $opt_y) {
     print <<EOT	## no critic (UselessNoCritic InputOutput::RequireCheckedSyscalls)
+Note that you can avoid the following questions by passing
+the '-n' or '-y' option to 'Makefile.PL'.
 
+EOT
+        if !$opt_y;
+
+    # Only do this site_perl substitution for non binary extensions!
+    my $site_lib = "$ExtUtils::MakeMaker::Config{siteprefix}/lib/site_perl";
+    if ($ExtUtils::MakeMaker::Config{installsitelib} ne $site_lib &&
+        grep $_ eq $site_lib, @INC) {
+        print <<EOT	## no critic (UselessNoCritic InputOutput::RequireCheckedSyscalls)
+Your default perl library install directory is $ExtUtils::MakeMaker::Config{installsitelib}.
+This works fine but has the drawback that the library files will not be found
+anymore if the perl version gets upgraded. Since $site_lib is in
+your default library search path I can use that instead
+
+EOT
+            if !$opt_y;
+        # arch directories needed to get packlist into /usr/local/lib/site_perl
+        map $ExtUtils::MakeMaker::Config{$_} = $site_lib, qw(installsitelib sitelibexp sitearchexp installsitearch) if
+            $opt_y ||
+            prompt("Use $site_lib as default library install directory ?", "y") =~ /^y/i;
+    }
+
+    print <<EOT	## no critic (UselessNoCritic InputOutput::RequireCheckedSyscalls)
 This package comes with a program that I can try
-to install in $Config{installsitebin}.
-
-   Note that you can avoid this question by passing
-   the '-n' or '-y' option to 'Makefile.PL'.
+to install in $ExtUtils::MakeMaker::Config{installsitebin}.
 
 EOT
 if !$opt_y;
@@ -51,12 +71,15 @@ settings();
 
 WriteMakefile
     (NAME              => 'Wiki::TiddlyWiki::Classic::Saver',
+     # finds $VERSION, requires EU::MM from perl >= 5.5
      VERSION_FROM      => 'lib/Wiki/TiddlyWiki/Classic/Saver/Package.pm',
      eval {
          ## no critic (UselessNoCritic MagicNumbers)
          ExtUtils::MakeMaker->VERSION(6.55_01);
          1;
      } ? (BUILD_REQUIRES	=> {
+         # To generate README.md when editing source. Not needed for build
+         # "Pod::Markdown::Github"	=> "0.02",
          # Only for the tests
          "Test::More"	=> "0.01",
      }) : (),
@@ -128,6 +151,18 @@ ppm_uninstall:
 	ppm uninstall $(DISTNAME)
 EOT
 
+    # You will need to add your own entry for README.md
+    $postamble{commit} = <<'EOT';
+commit: all README.md
+	release_pm
+	git commit -av
+EOT
+
+    $postamble{version_check} = <<'EOT';
+all ::
+	$(NOECHO) $(FULLPERL) version_check "$(NAME)" "$(DESTINSTALLSITELIB)" "$(VERSION)" "$(VERSION_FROM)"
+EOT
+
 undef &postamble;	## no critic (UselessNoCritic AmpersandSigils)
 }
 {
@@ -142,23 +177,10 @@ sub settings {
     package MY;
     our %postamble;
 
-    $postamble{version_check} = <<'EOF';
-all ::
-	$(NOECHO) $(FULLPERL) version_check "$(NAME)" "$(DESTINSTALLSITELIB)" "$(VERSION)" "$(VERSION_FROM)"
-EOF
+    $postamble{README} = <<'EOT';
+README.md: bin/tiddly_update
+	pod2readme -f github $< $@
 
-    $postamble{ppm} = <<'EOT';
-ppm: $(DISTNAME).ppd
-	$(PERL) bin/makeppd.pl --min_version=1.016 "--zip=$(ZIP)" "--tar=$(TAR)" "--compress=$(COMPRESS)" --leave=ppm $(DISTNAME).ppd $(VERSION)
-EOT
-
-    $postamble{ppm3} = <<'EOT';
-ppm3: $(DISTNAME).ppd
-	$(PERL) bin/makeppd.pl --min_version=1.016 "--zip=$(ZIP)" "--tar=$(TAR)" "--compress=$(COMPRESS)" --ppm_version=3 --leave=ppm3 $(DISTNAME).ppd $(VERSION)
-EOT
-
-    $postamble{ppm4} = <<'EOT';
-ppm4: $(DISTNAME).ppd
-	$(PERL) bin/makeppd.pl --min_version=1.016 "--zip=$(ZIP)" "--tar=$(TAR)" "--compress=$(COMPRESS)" --ppm_version=4 --leave=ppm4 $(DISTNAME).ppd $(VERSION)
+dist: README.md
 EOT
 }
